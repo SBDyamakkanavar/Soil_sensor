@@ -1,0 +1,215 @@
+#include <HardwareSerial.h>
+#include <HTTPClient.h>  // Include the HTTPClient library
+
+// Define the SIM800L serial port (UART2 on ESP32)
+HardwareSerial sim800(1);
+
+#define RXD2 5   // ESP32 RX (Connect to SIM800 TX)
+#define TXD2 18  // ESP32 TX (Connect to SIM800 RX)
+
+#define MOISTURE_SENSOR_1_PIN 34  // First moisture sensor analog pin
+#define MOISTURE_SENSOR_2_PIN 35  // Second moisture sensor analog pin
+
+// Define dry and wet calibration values for both sensors
+const int dryValue1 = 4095;  // Dry value for First moisture sensor
+const int wetValue1 = 1600;  // Wet value for First moisture sensor
+const int dryValue2 = 4095;  // Dry value for Second moisture sensor
+const int wetValue2 = 1600;  // Wet value for Second moisture sensor
+
+#define SerialPort Serial2
+#define LED_PIN 2
+
+// Query commands
+uint8_t phQuery[] = {0x01, 0x03, 0x00, 0x06, 0x00, 0x01, 0x64, 0x0B};         // Query for pH
+uint8_t tempQuery[] = {0x01, 0x03, 0x00, 0x13, 0x00, 0x01, 0x75, 0xCF};       // Query for Temperature
+uint8_t moistureQuery[] = {0x01, 0x03, 0x00, 0x12, 0x00, 0x01, 0x24, 0x0F};   // Query for Moisture
+uint8_t conductivityQuery[] = {0x01, 0x03, 0x00, 0x15, 0x00, 0x01, 0x95, 0xCE}; // Query for Conductivity
+uint8_t nitrogenQuery[] = {0x01, 0x03, 0x00, 0x1E, 0x00, 0x01, 0xE4, 0x0C};    // Query for Nitrogen
+uint8_t phosphorusQuery[] = {0x01, 0x03, 0x00, 0x1F, 0x00, 0x01, 0xB5, 0xCC};  // Query for Phosphorus
+uint8_t potassiumQuery[] = {0x01, 0x03, 0x00, 0x20, 0x00, 0x01, 0x85, 0xC0};   // Query for Potassium
+
+float pHValue = 0.0;
+float temperatureValue = 0.0;
+int moisturePercent = 0;
+int conductivityScale = 0;
+int nitrogenValue = 0;
+int phosphorusValue = 0;
+int potassiumValue = 0;
+int ledStatus = 0;  // 0 = OFF, 1 = ON
+
+unsigned long previousMillis = 0;  // Store the last time sensors were read
+const long interval = 5000;        // Interval to read sensors and send data
+
+// Non-blocking variables for sending data
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 2000;  // Send data every 2 seconds
+
+void sendATCommand(const char* command, int delayMs = 500) {
+    Serial.print("Sending: ");
+    Serial.println(command);
+    sim800.println(command);
+    delay(delayMs);
+
+    while (sim800.available()) {
+        String response = sim800.readString();
+        Serial.println("Response: " + response);
+    }
+}
+
+bool sendATCommandWithRetry(const char* command, const char* expectedResponse, int maxRetries = 3, int delayMs = 500) {
+    for (int i = 0; i < maxRetries; i++) {
+        Serial.print("Sending: ");
+        Serial.println(command);
+        sim800.println(command);
+        delay(delayMs);
+
+        String response = sim800.readString();
+        Serial.println("Response: " + response);
+
+        if (response.indexOf(expectedResponse) != -1) {
+            return true;  // Command succeeded
+        }
+    }
+    return false;  // Command failed after retries
+}
+
+void setup() {
+    Serial.begin(115200);
+    sim800.begin(9600, SERIAL_8N1, RXD2, TXD2);
+
+    Serial.println("Initializing SIM800L...");
+    if (!sendATCommandWithRetry("AT", "OK")) {
+        Serial.println("Failed to initialize SIM800L. Check connections.");
+        while (1);  // Halt execution
+    }
+    sendATCommand("AT+CPIN?");  // Check SIM
+    sendATCommand("AT+CSQ");    // Signal strength
+    sendATCommand("AT+CGATT=1");  // Enable GPRS
+    sendATCommand("AT+CIPSHUT");  // Reset GPRS
+    sendATCommand("AT+CSTT=\"airtelgprs.com\",\"\",\"\"");  // Set APN
+    sendATCommand("AT+CIICR", 3000);  // Bring up wireless connection
+    sendATCommand("AT+CIFSR");  // Get IP Address
+
+    pinMode(LED_PIN, OUTPUT);                     // Set LED pin as output
+    SerialPort.begin(9600, SERIAL_8N1, 16, 17);  // Adjust the pins according to your ESP32's hardware serial pins
+}
+
+void loop() {
+    unsigned long currentMillis = millis();
+
+    // Read sensor data at regular intervals
+    if (currentMillis - previousMillis >= interval) {
+        previousMillis = currentMillis;
+        readSensorData();
+    }
+
+    // Send data to server at regular intervals
+    if (currentMillis - lastSendTime >= sendInterval) {
+        lastSendTime = currentMillis;
+        sendDataToServer(moisturePercent);
+    }
+}
+
+void readSensorData() {
+    // Read and display pH
+    Serial.println("Reading pH...");
+    readAndDisplaypH(phQuery, moistureQuery);
+    delay(500);
+
+    // Read and display Temperature
+    Serial.println("Reading Temperature...");
+    readAndDisplayValue(tempQuery, "Temperature (°C)");
+    delay(500);
+
+    // Read and display Moisture
+    Serial.println("Reading Moisture...");
+    readAndDisplayValue(moistureQuery, "Moisture (%)");
+    delay(500);
+
+    // Read and display Conductivity
+    Serial.println("Reading Conductivity...");
+    readAndDisplayValue(conductivityQuery, "Conductivity (1–10 scale)");
+    delay(500);
+
+    // Read and display Nitrogen
+    Serial.println("Reading Nitrogen...");
+    readAndDisplayValue(nitrogenQuery, "Nitrogen (ppm)");
+    delay(500);
+
+    // Read and display Phosphorus
+    Serial.println("Reading Phosphorus...");
+    readAndDisplayValue(phosphorusQuery, "Phosphorus (ppm)");
+    delay(500);
+
+    // Read and display Potassium
+    Serial.println("Reading Potassium...");
+    readAndDisplayValue(potassiumQuery, "Potassium (ppm)");
+    delay(500);
+
+    // Read raw values from the two moisture sensors
+    int moisture1 = analogRead(MOISTURE_SENSOR_1_PIN);  // Read moisture from the first sensor
+    int moisture2 = analogRead(MOISTURE_SENSOR_2_PIN);  // Read moisture from the second sensor
+
+    // Convert raw sensor readings to moisture percentage based on calibration values
+    int moisturePercent1 = map(moisture1, wetValue1, dryValue1, 100, 0);  // Map for first sensor
+    int moisturePercent2 = map(moisture2, wetValue2, dryValue2, 100, 0);  // Map for second sensor
+
+    // Combine the two moisture percentages by averaging them
+    int combinedMoisturePercent = (moisturePercent1 + moisturePercent2) / 2;  // Average the two readings
+
+    // Print the combined moisture value
+    Serial.print("Combined Moisture Percent: ");
+    Serial.println(combinedMoisturePercent);
+}
+
+void sendDataToServer(int combinedMoisturePercent) {
+    Serial.println("Sending data to server...");
+
+    // Start TCP connection
+    unsigned long startTime = millis();
+    if (!sendATCommandWithRetry("AT+CIPSTART=\"TCP\",\"iot.haegl.in\",80", "CONNECT OK")) {
+        Serial.println("Failed to start TCP connection.");
+        return;
+    }
+    unsigned long endTime = millis();
+    Serial.print("CIPSTART time: ");
+    Serial.println(endTime - startTime);
+
+    // Prepare the payload
+    String deviceName = "IoT_2024_SL_001";
+    String onlineStatus = "online";
+    String ledStatusString = ledStatus ? "ON" : "OFF";
+    int sensorId = 1;
+
+    String serverPayload = "device_name=" + deviceName + 
+                           "&sensor_id=" + sensorId + 
+                           "&status=" + onlineStatus +
+                           "&temperature=" + String(temperatureValue) +
+                           "&moisture=" + String(moisturePercent) +
+                           "&conductivity=" + String(conductivityScale) +
+                           "&pH=" + String(pHValue) +
+                           "&led_status=" + ledStatusString +
+                           "&overall_moisture=" + String(combinedMoisturePercent);
+
+    // Create HTTP POST request
+    String serverRequest = "POST /api/receive_data/ HTTP/1.0\r\nHost: iot.haegl.in\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + String(serverPayload.length()) + "\r\n\r\n" + serverPayload;
+
+    // Send HTTP request
+    startTime = millis();
+    String command = "AT+CIPSEND=" + String(serverRequest.length());
+    if (!sendATCommandWithRetry(command.c_str(), ">", 3, 500)) {
+        Serial.println("Failed to send data.");
+        return;
+    }
+    sim800.print(serverRequest);
+    endTime = millis();
+    Serial.print("CIPSEND time: ");
+    Serial.println(endTime - startTime);
+
+    // Close connection
+    sendATCommand("AT+CIPCLOSE", 500);
+
+    Serial.println("Data sent to server!");
+}
+
+// Rest of the functions (readAndDisplayValue, handleSensorData, categorizeMoisture, readAndDisplaypH) remain unchanged.
