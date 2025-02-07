@@ -1,0 +1,395 @@
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <HTTPClient.h>
+
+#define GPSBaud 9600
+#define RXD2 5   // ESP32 RX (Connect to SIM800 TX)
+#define TXD2 18  // ESP32 TX (Connect to SIM800 RX)
+
+HardwareSerial gpsSerial(2);
+HardwareSerial sim800(1);
+TinyGPSPlus gps;
+
+// Define moisture sensor pins and calibration values
+#define MOISTURE_SENSOR_1_PIN 34  // First moisture sensor analog pin
+#define MOISTURE_SENSOR_2_PIN 35  // Second moisture sensor analog pin
+const int dryValue1 = 4095;       // Dry value for First moisture sensor
+const int wetValue1 = 1600;       // Wet value for First moisture sensor
+const int dryValue2 = 4095;       // Dry value for Second moisture sensor
+const int wetValue2 = 1600;       // Wet value for Second moisture sensor
+
+#define SerialPort Serial2
+#define LED_PIN 2
+
+// Query commands
+uint8_t phQuery[] = { 0x01, 0x03, 0x00, 0x06, 0x00, 0x01, 0x64, 0x0B };            // Query for pH
+uint8_t tempQuery[] = { 0x01, 0x03, 0x00, 0x13, 0x00, 0x01, 0x75, 0xCF };          // Query for Temperature
+uint8_t moistureQuery[] = { 0x01, 0x03, 0x00, 0x12, 0x00, 0x01, 0x24, 0x0F };      // Query for Moisture
+uint8_t conductivityQuery[] = { 0x01, 0x03, 0x00, 0x15, 0x00, 0x01, 0x95, 0xCE };  // Query for Conductivity
+uint8_t nitrogenQuery[] = { 0x01, 0x03, 0x00, 0x1E, 0x00, 0x01, 0xE4, 0x0C };      // Query for Nitrogen
+uint8_t phosphorusQuery[] = { 0x01, 0x03, 0x00, 0x1F, 0x00, 0x01, 0xB5, 0xCC };    // Query for Phosphorus
+uint8_t potassiumQuery[] = { 0x01, 0x03, 0x00, 0x20, 0x00, 0x01, 0x85, 0xC0 };     // Query for Potassium
+
+float pHValue = 0.0;
+float temperatureValue = 0.0;
+int moisturePercent = 0;
+int conductivityScale = 0;
+int nitrogenValue = 0;
+int phosphorusValue = 0;
+int potassiumValue = 0;
+int ledStatus = 0;  // 0 = OFF, 1 = ON
+
+unsigned long previousMillis = 0;  // Store the last time sensors were read
+const long interval = 5000;        // Interval to read sensors and send data
+
+// Non-blocking variables for sending data
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 10000;  // Send data every 10 seconds
+
+void sendATCommand(const char* command, int delayMs = 500) {
+    Serial.print("Sending: ");
+    Serial.println(command);
+    sim800.println(command);
+    delay(delayMs);
+
+    while (sim800.available()) {
+        String response = sim800.readString();
+        Serial.println("Response: " + response);
+    }
+}
+
+bool sendATCommandWithRetry(const char* command, const char* expectedResponse, int maxRetries = 3, int delayMs = 500) {
+    for (int i = 0; i < maxRetries; i++) {
+        Serial.print("Sending: ");
+        Serial.println(command);
+        sim800.println(command);
+        delay(delayMs);
+
+        String response = sim800.readString();
+        Serial.println("Response: " + response);
+
+        if (response.indexOf(expectedResponse) != -1) {
+            return true;  // Command succeeded
+        }
+    }
+    return false;  // Command failed after retries
+}
+
+void setup() {
+    Serial.begin(115200);
+    gpsSerial.begin(GPSBaud, SERIAL_8N1, 21, 19); // RX = 21, TX = 19 for ESP32
+    delay(2000); // Wait for 2 seconds for GPS module to initialize
+    sim800.begin(9600, SERIAL_8N1, RXD2, TXD2);
+
+    Serial.println("Initializing SIM800L...");
+    if (!sendATCommandWithRetry("AT", "OK")) {
+        Serial.println("Failed to initialize SIM800L. Check connections.");
+        while (1);
+    }
+    sendATCommand("AT+CPIN?");
+    sendATCommand("AT+CSQ");
+    sendATCommand("AT+CGATT=1");
+    sendATCommand("AT+CIPSHUT");
+    sendATCommand("AT+CSTT=\"airtelgprs.com\",\"\",\"\"");
+    sendATCommand("AT+CIICR", 3000);
+    sendATCommand("AT+CIFSR");
+
+    pinMode(LED_PIN, OUTPUT);                    // Set LED pin as output
+    SerialPort.begin(9600, SERIAL_8N1, 16, 17);  // Adjust the pins according to your ESP32's hardware serial pins
+}
+
+void loop() {
+    unsigned long currentMillis = millis();
+
+    // Read sensor data at regular intervals
+    if (currentMillis - previousMillis >= interval) {
+        previousMillis = currentMillis;
+        readSensorData();
+    }
+
+    // Read GPS data
+    while (gpsSerial.available() > 0) {
+        gps.encode(gpsSerial.read());
+
+        if (gps.location.isUpdated()) {
+            float latitude = gps.location.lat();
+            float longitude = gps.location.lng();
+            Serial.print("Latitude: ");
+            Serial.println(latitude, 6);
+            Serial.print("Longitude: ");
+            Serial.println(longitude, 6);
+        } else {
+            Serial.println("GPS data not updated yet.");
+        }
+    }
+
+    // Send data to server at regular intervals
+    if (currentMillis - lastSendTime >= sendInterval) {
+        lastSendTime = currentMillis;
+        if (gps.location.isValid()) { // Check if GPS data is valid
+            sendDataToServer(moisturePercent, gps.location.lat(), gps.location.lng());
+        } else {
+            Serial.println("GPS data is not valid. Waiting for valid GPS data...");
+        }
+    }
+}
+
+void readSensorData() {
+    // Read and display pH
+    Serial.println("Reading pH...");
+    readAndDisplaypH(phQuery, moistureQuery);
+    delay(500);
+
+    // Read and display Temperature
+    Serial.println("Reading Temperature...");
+    readAndDisplayValue(tempQuery, "Temperature (°C)");
+    delay(500);
+
+    // Read and display Moisture
+    Serial.println("Reading Moisture...");
+    readAndDisplayValue(moistureQuery, "Moisture (%)");
+    delay(500);
+
+    // Read and display Conductivity
+    Serial.println("Reading Conductivity...");
+    readAndDisplayValue(conductivityQuery, "Conductivity (1–10 scale)");
+    delay(500);
+
+    // Read and display Nitrogen
+    Serial.println("Reading Nitrogen...");
+    readAndDisplayValue(nitrogenQuery, "Nitrogen (ppm)");
+    delay(500);
+
+    // Read and display Phosphorus
+    Serial.println("Reading Phosphorus...");
+    readAndDisplayValue(phosphorusQuery, "Phosphorus (ppm)");
+    delay(500);
+
+    // Read and display Potassium
+    Serial.println("Reading Potassium...");
+    readAndDisplayValue(potassiumQuery, "Potassium (ppm)");
+    delay(500);
+
+    // Read raw values from the two moisture sensors
+    int moisture1 = analogRead(MOISTURE_SENSOR_1_PIN);  // Read moisture from the first sensor
+    int moisture2 = analogRead(MOISTURE_SENSOR_2_PIN);  // Read moisture from the second sensor
+
+    // Convert raw sensor readings to moisture percentage based on calibration values
+    int moisturePercent1 = map(moisture1, wetValue1, dryValue1, 100, 0);  // Map for first sensor
+    int moisturePercent2 = map(moisture2, wetValue2, dryValue2, 100, 0);  // Map for second sensor
+
+    // Combine the two moisture percentages by averaging them
+    int combinedMoisturePercent = (moisturePercent1 + moisturePercent2) / 2;  // Average the two readings
+
+    // Print the combined moisture value
+    Serial.print("Combined Moisture Percent: ");
+    Serial.println(combinedMoisturePercent);
+}
+
+void sendDataToServer(int combinedMoisturePercent, float latitude, float longitude) {
+    Serial.println("Sending data to server...");
+
+    // Start TCP connection
+    unsigned long startTime = millis();
+    if (!sendATCommandWithRetry("AT+CIPSTART=\"TCP\",\"iot.haegl.in\",80", "CONNECT OK")) {
+        Serial.println("Failed to start TCP connection.");
+        return;
+    }
+    unsigned long endTime = millis();
+    Serial.print("CIPSTART time: ");
+    Serial.println(endTime - startTime);
+
+    // Prepare the payload
+    String deviceName = "IoT_2024_SL_001";
+    String onlineStatus = "online";
+    String ledStatusString = ledStatus ? "ON" : "OFF";
+    int sensorId = 1;
+
+    // Prepare GPS location link
+    String gpsLink = "";
+    if (gps.location.isValid()) {  // Check if GPS data is valid
+        gpsLink = "https://www.google.com/maps?q=" + String(latitude, 6) + "," + String(longitude, 6);
+        Serial.print("GPS Link: ");
+        Serial.println(gpsLink);
+    } else {
+        Serial.println("GPS data is not valid.");
+    }
+
+    // Construct the server payload
+    String serverPayload = "device_name=" + deviceName + 
+                           "&sensor_id=" + sensorId + 
+                           "&status=" + onlineStatus + 
+                           "&temperature=" + String(temperatureValue) + 
+                           "&moisture=" + String(moisturePercent) + 
+                           "&conductivity=" + String(conductivityScale) + 
+                           "&pH=" + String(pHValue) + 
+                           "&led_status=" + ledStatusString + 
+                           "&overall_moisture=" + String(combinedMoisturePercent) + 
+                           "&latitude=" + String(latitude, 6) + 
+                           "&longitude=" + String(longitude, 6) + 
+                           "&gps_link=" + gpsLink;  // Add GPS link to payload
+
+    Serial.print("Server Payload: ");
+    Serial.println(serverPayload);
+
+    // Create HTTP POST request
+    String serverRequest = "POST /api/receive_data/ HTTP/1.0\r\n"
+                           "Host: iot.haegl.in\r\n"
+                           "Content-Type: application/x-www-form-urlencoded\r\n"
+                           "Content-Length: " + String(serverPayload.length()) + "\r\n\r\n" + 
+                           serverPayload;
+
+    // Send HTTP request
+    startTime = millis();
+    String command = "AT+CIPSEND=" + String(serverRequest.length());
+    if (!sendATCommandWithRetry(command.c_str(), ">", 3, 500)) {
+        Serial.println("Failed to send data.");
+        return;
+    }
+    sim800.print(serverRequest);
+    endTime = millis();
+    Serial.print("CIPSEND time: ");
+    Serial.println(endTime - startTime);
+
+    // Close connection
+    sendATCommand("AT+CIPCLOSE", 500);
+
+    Serial.println("Data sent to server!");
+}
+
+void readAndDisplayValue(uint8_t* query, const char* paramName) {
+    SerialPort.write(query, 8);  // Send the query
+    delay(100);                  // Wait for response
+
+    if (SerialPort.available() >= 7) {  // Check if enough data is available
+        uint8_t response[7];
+        SerialPort.readBytes(response, 7);
+
+        // Validate response
+        if (response[0] == 0x01 && response[1] == 0x03) {
+            uint16_t value = (response[3] << 8) | response[4];  // Combine high and low bytes
+            handleSensorData(value, paramName);
+        } else {
+            Serial.print(paramName);
+            Serial.println(": Invalid response (incorrect data)");
+        }
+    } else {
+        Serial.print(paramName);
+        Serial.println(": No response (timeout or connection issue)");
+    }
+}
+
+void handleSensorData(uint16_t value, const char* paramName) {
+    if (strcmp(paramName, "Temperature (°C)") == 0) {
+        // Apply scaling factor for temperature
+        temperatureValue = value / 10.0;
+        Serial.print(paramName);
+        Serial.print(": ");
+        Serial.print(temperatureValue, 1);  // Display with 1 decimal place
+        Serial.println(" °C");
+
+    } else if (strcmp(paramName, "Moisture (%)") == 0) {
+        if (value <= 600) {
+            // Map raw moisture value to a 0–100 scale
+            moisturePercent = map(value, 0, 600, 0, 100);
+        } else {
+            moisturePercent = 100;
+        }
+        Serial.print(paramName);
+        Serial.print(": ");
+        Serial.print(moisturePercent);
+        Serial.print(" % (");
+        Serial.print(categorizeMoisture(moisturePercent));
+        Serial.println(")");
+
+        // LED control based on moisture level
+        if (moisturePercent < 30) {     // Example: below 30% is considered dry
+            digitalWrite(LED_PIN, HIGH);  // Turn LED ON for dry conditions
+        } else {
+            digitalWrite(LED_PIN, LOW);  // Turn LED OFF for sufficient moisture
+        }
+
+    } else if (strcmp(paramName, "Conductivity (1–10 scale)") == 0) {
+        // Map conductivity to a 1–10 scale
+        conductivityScale = map(value, 0, 10000, 1, 10);
+        Serial.print(paramName);
+        Serial.print(": ");
+        Serial.println(conductivityScale);
+
+    } else if (strcmp(paramName, "Nitrogen (ppm)") == 0) {
+        nitrogenValue = value;
+        Serial.print(paramName);
+        Serial.print(": ");
+        Serial.println(nitrogenValue);
+
+    } else if (strcmp(paramName, "Phosphorus (ppm)") == 0) {
+        phosphorusValue = value;
+        Serial.print(paramName);
+        Serial.print(": ");
+        Serial.println(phosphorusValue);
+
+    } else if (strcmp(paramName, "Potassium (ppm)") == 0) {
+        potassiumValue = value;
+        Serial.print(paramName);
+        Serial.print(": ");
+        Serial.println(potassiumValue);
+    } else {
+        Serial.print(paramName);
+        Serial.println(": Unrecognized parameter");
+    }
+}
+
+const char* categorizeMoisture(int moisturePercent) {
+    if (moisturePercent >= 0 && moisturePercent <= 10) {
+        return "Fully Dry";
+    } else if (moisturePercent >= 11 && moisturePercent <= 25) {
+        return "Medium Dry";
+    } else if (moisturePercent >= 26 && moisturePercent <= 45) {
+        return "Medium Wet";
+    } else if (moisturePercent >= 46 && moisturePercent <= 80) {
+        return "Wet";
+    } else if (moisturePercent >= 81 && moisturePercent <= 100) {
+        return "Fully Wet";
+    }
+    return "Unknown";
+}
+
+void readAndDisplaypH(uint8_t* pHQuery, uint8_t* moistureQuery) {
+    // Read moisture value
+    SerialPort.write(moistureQuery, 8);
+    delay(100);
+
+    uint16_t moistureValue = 0;
+    if (SerialPort.available() >= 7) {
+        uint8_t response[7];
+        SerialPort.readBytes(response, 7);
+        if (response[0] == 0x01 && response[1] == 0x03) {
+            moistureValue = (response[3] << 8) | response[4];
+        }
+    }
+    int moisturePercent = map(moistureValue, 0, 1000, 0, 100);
+
+    // Read pH value
+    SerialPort.write(pHQuery, 8);
+    delay(100);
+
+    if (SerialPort.available() >= 7) {
+        uint8_t response[7];
+        SerialPort.readBytes(response, 7);
+        if (response[0] == 0x01 && response[1] == 0x03) {
+            uint16_t value = (response[3] << 8) | response[4];
+            pHValue = value / 100.0;
+
+            // Set pH to 0.0 if moisture is 0 and pH is 7.0
+            if (moisturePercent == 0 && pHValue == 7.0) {
+                pHValue = 0.0;
+            }
+            Serial.print("pH: ");
+            Serial.println(pHValue);
+        } else {
+            Serial.println("pH: Invalid response (incorrect data)");
+        }
+    } else {
+        Serial.println("pH: No response (timeout or connection issue)");
+    }
+}
